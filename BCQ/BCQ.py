@@ -1,5 +1,8 @@
-#https://github.com/sfujim/BCQ/blob/master/continuous_BCQ/BCQ.py
-
+'''
+Adapted from 
+https://github.com/sfujim/BCQ/blob/master/continuous_BCQ/BCQ.py
+https://github.com/vwxyzjn/cleanrl/blob/c1fb51a7c32596ef3133af4617f92d2095051c66/cleanrl/offline_dqn_cql_atari_visual.py
+'''
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,7 +12,10 @@ import random
 import torch.nn.functional as F
 
 from collections import deque
+
 from torch.utils.tensorboard import SummaryWriter
+import wandb
+
 from torch.distributions.normal import Normal
 from torch.utils.data.dataset import IterableDataset
 
@@ -103,8 +109,7 @@ class VAE(nn.Module):
         z = F.relu(self.e2(z))
         
         mean = self.mean(z)
-        #log_std = self.log_std(z).clamp(-4,15)# Clamped for numerical stability 
-        log_std = self.log_std(z)
+        log_std = self.log_std(z).clamp(-4,15)# Clamped for numerical stability 
         std = torch.exp(log_std)
         z = mean+std*torch.randn_like(std)
         
@@ -113,8 +118,7 @@ class VAE(nn.Module):
         
     def decode(self,state,z=None):
         if z is None:
-            #z = torch.randn((state.shape[0],self.latent_dim)).to(self.device).clamp(-0.5,0.5)
-            z = torch.randn((state.shape[0],self.latent_dim)).to(self.device).clamp(-1.5,1.5)
+            z = torch.randn((state.shape[0],self.latent_dim)).to(self.device).clamp(-0.5,0.5)
         a = F.relu(self.d1(torch.cat([state,z],1)))
         a = F.relu(self.d2(a))
         return self.max_action * torch.tanh(self.d3(a))
@@ -127,11 +131,9 @@ class BCQ(object):
                  tau=0.005,
                  actor_lr = 1e-3,
                  critic_lr = 1e-3,
-                 policy_noise =0.2,
-                 noise_clip = 0.5,
                  lmbda = 0.75,
                  phi = 0.05,
-                 policy_updatefreq=2):
+                 policy_updatefreq=1):
         
         latent_dim = action_dim * 2
         
@@ -153,8 +155,6 @@ class BCQ(object):
         self.tau = tau
         self.lmbda = lmbda
         self.device = device
-        self.policy_noise = policy_noise
-        self.noise_clip = noise_clip
         self.policy_updatefreq = policy_updatefreq
         
     def select_action(self, state):
@@ -175,9 +175,7 @@ class BCQ(object):
         reward = torch.FloatTensor(batch_reward).view(-1,1).to(self.device)
         not_done = torch.FloatTensor(1-batch_not_done).view(-1,1).to(self.device)
         # tensor conversion completed
-        #print(f'reward:{reward.shape}')
-        #print(f'state:{state.shape}')
-        #print(f'not_done:{not_done.shape}')
+
         # Variational Auto-Encoder Training
         recon,mean,std = self.vae(state,action)
         recon_loss = F.mse_loss(recon,action)
@@ -193,27 +191,25 @@ class BCQ(object):
             next_state = torch.repeat_interleave(next_state,10,0)
             
             next_action = self.actor_target(next_state, self.vae.decode(next_state))
-            #print(f'next_action:{next_action.shape}')
+
             #Compute the target
             target_Q1,target_Q2 = self.critic_target(next_state,next_action)
-            #print(f'target_Q1:{target_Q1.shape}')
-            #print(f'target_Q2:{target_Q2.shape}')
+
             # Soft Clipped Double Q-learning 
             target_Q = self.lmbda * torch.min(target_Q1,target_Q2)+(1.-self.lmbda)*torch.max(target_Q1,target_Q2)
-            #print(f'target_Q_min:{target_Q.shape}')
+
             # Take max over each action sampled from the VAE
             target_Q = target_Q.reshape(batch_size,-1).max(1)[0].reshape(-1,1)
-            #print(f'target_Q_reshape:{target_Q.shape}')
+
             target_Q = reward + (not_done * self.discount*target_Q)
-            #print(f'target_Q:{target_Q.shape}')
+
             
         #Get current Estimates
         current_Q1,current_Q2 = self.critic(state,action)
-        #print(f'current_Q1:{current_Q1.shape}')
-        #print(f'current_Q2:{current_Q2.shape}')
+
         #Compute Critic loass
         critic_loss = F.mse_loss(target_Q,current_Q1)+F.mse_loss(target_Q,current_Q2)
-        #print(f'critic_loss:{critic_loss.shape}')
+
         writer.add_scalar("losses/criticloss",critic_loss.item(),current_step)
         #Optimize the critic
         self.critic_optimizer.zero_grad()
@@ -264,9 +260,9 @@ def eval_policy(policy, env_name ,seed, eval_episodes=10):
     return avg_reward
 
 #selct the Gym enviornment
-gym_id = "HopperBulletEnv-v0"
+gym_id = "AntBulletEnv-v0"
 env = gym.make(gym_id)
-offline_gym_id = 'hopper-bullet-medium-v0'
+offline_gym_id = 'ant-bullet-medium-v0'
 dataset_env = gym.make(offline_gym_id)
 dataset_env.reset()
 
@@ -284,14 +280,12 @@ max_action = float(env.action_space.high[0])
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.shape[0]  
 
-
+#set the hyperpaparemeters
 actor_learning_rate = 1e-3
 critic_learning_rate = 1e-3
-total_timesteps = 10000000
-learning_starts = 0
+total_timesteps = 4000000
 batch_size = 100
-policy_updatefreq = 1
-eval_frequency = 1000
+eval_frequency = 5000
 
 # Selecting the device (CPU or GPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -299,13 +293,21 @@ print(device)
 
 data_loader = iter(torch.utils.data.DataLoader(
     ExperienceReplayDataset(), batch_size=batch_size, num_workers=2))
-#replay_buffer = ReplayBuffer()
+
 BCQ_policy = BCQ(state_dim,action_dim,max_action,device,\
                    actor_lr=actor_learning_rate,critic_lr =critic_learning_rate )
 
+# Setup the Wandb and Tensorboard for logging    
+wandb_config = dict(actor_lr = actor_learning_rate,
+critic_lr = critic_learning_rate,
+total_timesteps = total_timesteps,
+batch_size = batch_size,
+eval_frequency = eval_frequency)
 
 suffix = f"BCQ_{offline_gym_id}_{int(time.time())}"
+wandb.init(project=f"BCQ_{offline_gym_id}",config=wandb_config,sync_tensorboard=True,monitor_gym=True, save_code=True,name=suffix)
 writer = SummaryWriter(f"runs/{suffix}")
+
 
 # Time to train and collect Rewards
 
